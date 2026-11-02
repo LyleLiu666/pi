@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CredentialStore, createModels, type Provider } from "@earendil-works/pi-ai";
@@ -176,6 +177,55 @@ describe("AuthStorage", () => {
 		const storage = AuthStorage.create(authJsonPath);
 		expect(await storage.modify("anthropic", async () => undefined)).toEqual({ type: "api_key", key: "stored" });
 		expect(await storage.read("anthropic")).toEqual({ type: "api_key", key: "stored" });
+	});
+
+	// #11655: another process can use the real file while this one uses a symlink.
+	test.each(["sync", "async"])("%s update locks and writes the target of the auth symlink", async (mode) => {
+		writeAuthJson({});
+		const alias = join(tempDir, "alias.json");
+		const other = join(tempDir, "other.json");
+		writeFileSync(other, "{}");
+		symlinkSync(authJsonPath, alias, "file");
+		const backend = new FileAuthStorageBackend(alias);
+		const update = () => {
+			const contender = spawnSync(
+				process.execPath,
+				["-e", "require('proper-lockfile').lockSync(process.argv[1])()", authJsonPath],
+				{
+					encoding: "utf8",
+					timeout: 5000,
+				},
+			);
+			expect(contender.stderr).toContain("ELOCKED");
+			// A new link target must not receive a write protected by the old target's lock.
+			rmSync(alias);
+			symlinkSync(other, alias, "file");
+			return { result: undefined, next: '{"updated":true}' };
+		};
+		if (mode === "sync") backend.withLock(update);
+		else await backend.withLockAsync(async () => update());
+		expect(readFileSync(authJsonPath, "utf8")).toBe('{"updated":true}');
+		expect(readFileSync(other, "utf8")).toBe("{}");
+	});
+
+	// #11655: a waiting read can acquire its lock after the configured link has changed.
+	test("does not cache the old target's credentials under the new target's revision", async () => {
+		writeAuthJson({ provider: { type: "api_key", key: "initial" } });
+		const alias = join(tempDir, "alias.json");
+		const other = join(tempDir, "other.json");
+		writeFileSync(other, JSON.stringify({ provider: { type: "api_key", key: "other" } }));
+		symlinkSync(authJsonPath, alias, "file");
+		const storage = AuthStorage.create(alias);
+		writeAuthJson({ provider: { type: "api_key", key: "changed" } });
+		const lock = lockfile.lock;
+		vi.spyOn(lockfile, "lock").mockImplementationOnce(async (file, options) => {
+			const release = await lock(file, options);
+			rmSync(alias);
+			symlinkSync(other, alias, "file");
+			return release;
+		});
+		await storage.read("provider");
+		await expect(storage.read("provider")).resolves.toMatchObject({ key: "other" });
 	});
 
 	test("serializes concurrent modifications", async () => {

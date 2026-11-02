@@ -4,7 +4,7 @@
  */
 
 import type { AuthOperationOptions, Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
@@ -51,9 +51,10 @@ type AuthFileReadState = {
 let sharedAuthFileReadState: { authPath: string; readState: AuthFileReadState } | undefined;
 
 export interface AuthStorageBackend {
-	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
+	// File backends pass the locked path so a cached revision describes the file that supplied the content.
+	withLock<T>(fn: (current: string | undefined, lockedPath?: string) => LockResult<T>): T;
 	withLockAsync<T>(
-		fn: (current: string | undefined) => Promise<LockResult<T>>,
+		fn: (current: string | undefined, lockedPath?: string) => Promise<LockResult<T>>,
 		options?: AuthOperationOptions,
 	): Promise<T>;
 }
@@ -65,17 +66,16 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		this.authPath = normalizePath(authPath);
 	}
 
-	private ensureParentDir(): void {
+	private prepareAuthPath(): string {
 		const dir = dirname(this.authPath);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true, mode: 0o700 });
 		}
-	}
-
-	private ensureFileExists(): void {
 		if (!existsSync(this.authPath)) {
 			writeFileSync(this.authPath, "{}", AUTH_FILE_WRITE_OPTIONS);
 		}
+		// Lock, read and write the same target even if a symlink is redirected during a refresh.
+		return realpathSync(this.authPath);
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -94,17 +94,16 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		}
 	}
 
-	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T {
-		this.ensureParentDir();
-		this.ensureFileExists();
+	withLock<T>(fn: (current: string | undefined, lockedPath: string) => LockResult<T>): T {
+		const path = this.prepareAuthPath();
 
 		let release: (() => void) | undefined;
 		try {
-			release = this.acquireLockSyncWithRetry(this.authPath);
-			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
-			const { result, next } = fn(current);
+			release = this.acquireLockSyncWithRetry(path);
+			const current = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+			const { result, next } = fn(current, path);
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				writeFileSync(path, next, AUTH_FILE_WRITE_OPTIONS);
 			}
 			return result;
 		} finally {
@@ -115,6 +114,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	private async acquireLockAsync(
+		path: string,
 		signal: AbortSignal | undefined,
 		onCompromised: (error: Error) => void,
 	): Promise<() => Promise<void>> {
@@ -127,7 +127,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			signal?.throwIfAborted();
 			let release: (() => Promise<void>) | undefined;
 			try {
-				release = await lockfile.lock(this.authPath, {
+				release = await lockfile.lock(path, {
 					realpath: false,
 					retries: 0,
 					stale: staleMs,
@@ -156,12 +156,11 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	async withLockAsync<T>(
-		fn: (current: string | undefined) => Promise<LockResult<T>>,
+		fn: (current: string | undefined, lockedPath: string) => Promise<LockResult<T>>,
 		options?: AuthOperationOptions,
 	): Promise<T> {
 		options?.signal?.throwIfAborted();
-		this.ensureParentDir();
-		this.ensureFileExists();
+		const path = this.prepareAuthPath();
 
 		let release: (() => Promise<void>) | undefined;
 		let lockCompromised = false;
@@ -173,19 +172,19 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		};
 
 		try {
-			release = await this.acquireLockAsync(options?.signal, (error) => {
+			release = await this.acquireLockAsync(path, options?.signal, (error) => {
 				lockCompromised = true;
 				lockCompromisedError = error;
 			});
 
 			throwIfCompromised();
 			options?.signal?.throwIfAborted();
-			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
-			const { result, next } = await fn(current);
+			const current = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+			const { result, next } = await fn(current, path);
 			throwIfCompromised();
 			options?.signal?.throwIfAborted();
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				writeFileSync(path, next, AUTH_FILE_WRITE_OPTIONS);
 			}
 			throwIfCompromised();
 			return result;
@@ -379,9 +378,9 @@ export class AuthStorage implements CredentialStore {
 		let content: string | undefined;
 		let revision: string | undefined;
 		try {
-			this.storage.withLock((current) => {
+			this.storage.withLock((current, lockedPath) => {
 				content = current;
-				revision = this.authPath ? getFileRevision(this.authPath) : undefined;
+				revision = lockedPath ? getFileRevision(lockedPath) : undefined;
 				return { result: undefined };
 			});
 			this.updateReadState(this.parseStorageData(content), revision);
@@ -391,9 +390,9 @@ export class AuthStorage implements CredentialStore {
 	}
 
 	private async reloadFromStorageAsync(options?: AuthOperationOptions): Promise<AuthStorageData> {
-		return this.storage.withLockAsync(async (content) => {
+		return this.storage.withLockAsync(async (content, lockedPath) => {
 			const currentData = this.parseStorageData(content);
-			const revision = this.authPath ? getFileRevision(this.authPath) : undefined;
+			const revision = lockedPath ? getFileRevision(lockedPath) : undefined;
 			this.updateReadState(currentData, revision);
 			return { result: currentData };
 		}, options);
@@ -454,12 +453,12 @@ export class AuthStorage implements CredentialStore {
 	): Promise<Credential | undefined> {
 		let latestData = this.readState.data;
 		let revision: string | undefined;
-		const result = await this.storage.withLockAsync(async (content) => {
+		const result = await this.storage.withLockAsync(async (content, lockedPath) => {
 			const currentData = this.parseStorageData(content);
 			const next = await fn(currentData[provider]);
 			if (next === undefined) {
 				latestData = currentData;
-				revision = this.authPath ? getFileRevision(this.authPath) : undefined;
+				revision = lockedPath ? getFileRevision(lockedPath) : undefined;
 				return { result: currentData[provider] };
 			}
 

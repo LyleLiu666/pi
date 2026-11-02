@@ -4,7 +4,7 @@ import { getAgentDir } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { getFileRevision, normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
-import { type AuthStorageBackend, FileAuthStorageBackend } from "./auth-storage.ts";
+import { FileAuthStorageBackend } from "./auth-storage.ts";
 
 type StoredModels = Record<string, ModelsStoreEntry>;
 
@@ -45,7 +45,7 @@ export class InMemoryCodingAgentModelsStore implements ModelsStore {
 
 /** Locked JSON-backed storage for dynamically refreshed provider catalogs. */
 export class FileModelsStore implements ModelsStore {
-	private readonly storage: AuthStorageBackend;
+	private readonly storage: FileAuthStorageBackend;
 	private readonly path: string;
 	private readonly readState: ModelsFileReadState;
 
@@ -72,9 +72,9 @@ export class FileModelsStore implements ModelsStore {
 		readState: ModelsFileReadState,
 		options?: ModelsStoreOperationOptions,
 	): Promise<StoredModels> {
-		return this.storage.withLockAsync(async (content) => {
+		return this.storage.withLockAsync(async (content, lockedPath) => {
 			const data = this.parse(content);
-			this.updateReadState(readState, data, getFileRevision(this.path));
+			this.updateReadState(readState, data, getFileRevision(lockedPath));
 			return { result: data };
 		}, options);
 	}
