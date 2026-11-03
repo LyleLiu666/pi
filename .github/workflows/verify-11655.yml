@@ -29,13 +29,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends fd-find ripgrep
           command -v fd || sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
           npm ci --ignore-scripts
-      - name: Build with the repository's pinned model catalog
+      - name: Generate the CI model data and build the exact source tree
         run: |
-          revision="$(node -p 'require("./nix/model-catalog.json").revision')"
-          catalog="$RUNNER_TEMP/models.all.json"
-          curl -fsSL --retry 3 "https://pi.dev/api/models/revisions/${revision}?types=chat,image,classifier" -o "$catalog"
-          printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum --check
-          node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+          npm run hydrate:model-data
           npm run build:offline
           npm run build:daemon --workspace packages/env
           git diff --exit-code HEAD
