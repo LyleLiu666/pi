@@ -1,0 +1,43 @@
+name: Verify 11655 fork commit
+
+on:
+  push:
+    branches: [codex/verify-11655-fd6110f]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'LyleLiu666/pi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fd6110f3549431bf1958a359199eb6651c2021b8
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install test prerequisites
+        run: |
+          git log -1 --format='%H %s'
+          test "$(git rev-parse HEAD)" = fd6110f3549431bf1958a359199eb6651c2021b8
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fd-find ripgrep
+          command -v fd || sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
+          npm ci --ignore-scripts
+      - name: Build with the repository's pinned model catalog
+        run: |
+          revision="$(node -p 'require("./nix/model-catalog.json").revision')"
+          catalog="$RUNNER_TEMP/models.all.json"
+          curl -fsSL --retry 3 "https://pi.dev/api/models/revisions/${revision}?types=chat,image,classifier" -o "$catalog"
+          printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum --check
+          node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+          npm run build:offline
+          npm run build:daemon --workspace packages/env
+          git diff --exit-code HEAD
+      - name: Run the full isolated test suite
+        run: ./test.sh
